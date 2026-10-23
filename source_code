@@ -1,0 +1,276 @@
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <DHTesp.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// ---------- Wi-Fi / ThingSpeak ----------
+const char* WIFI_SSID = "Wokwi-GUEST";
+const char* WIFI_PASSWORD = "";
+
+const char* THINGSPEAK_WRITE_KEY = "G9XHXW94I76VPMHI"; // Add your Write API Key
+const char* THINGSPEAK_URL =
+    "http://api.thingspeak.com/update";
+
+// ---------- Pin configuration ----------
+const int DHT_PIN = 15;
+const int GAS_PIN = 34;
+const int RELAY_PIN = 26;
+const int BUZZER_PIN = 25;
+
+// ---------- HVAC configuration ----------
+const float COOLING_ON_TEMP = 28.0;
+const float COOLING_OFF_TEMP = 25.0;
+
+// Simulation threshold only; tune after observing MQ-2 readings.
+const int GAS_THRESHOLD = 1800;
+
+// Change to false if your relay is active LOW.
+const bool RELAY_ACTIVE_HIGH = true;
+
+// ---------- Objects and states ----------
+DHTesp dht;
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+enum SystemState {
+  NORMAL,
+  COOLING,
+  ALARM
+};
+
+SystemState state = NORMAL;
+bool coolingDemand = false;
+bool alarmActive = false;
+
+float temperature = NAN;
+float humidity = NAN;
+int gasReading = 0;
+
+unsigned long lastSensorRead = 0;
+unsigned long lastCloudUpdate = 0;
+
+const unsigned long SENSOR_INTERVAL_MS = 2500;
+const unsigned long CLOUD_INTERVAL_MS = 20000;
+
+// ---------- Helpers ----------
+void setHVAC(bool on) {
+  digitalWrite(
+    RELAY_PIN,
+    (on == RELAY_ACTIVE_HIGH) ? HIGH : LOW
+  );
+}
+
+const char* stateName() {
+  switch (state) {
+    case NORMAL:  return "NORMAL";
+    case COOLING: return "COOLING";
+    case ALARM:   return "ALARM";
+  }
+  return "UNKNOWN";
+}
+
+void updateOutputs() {
+  // Safety priority: alarm always overrides cooling.
+  if (alarmActive) {
+    state = ALARM;
+    coolingDemand = false;
+  } else {
+    // Hysteresis: switch ON at 28 C, OFF at 25 C.
+    if (!isnan(temperature)) {
+      if (temperature >= COOLING_ON_TEMP) {
+        coolingDemand = true;
+      } else if (temperature <= COOLING_OFF_TEMP) {
+        coolingDemand = false;
+      }
+    }
+
+    state = coolingDemand ? COOLING : NORMAL;
+  }
+
+  setHVAC(state == COOLING);
+
+  if (alarmActive) {
+    tone(BUZZER_PIN, 2200);
+  } else {
+    noTone(BUZZER_PIN);
+  }
+}
+
+void updateLCD() {
+  lcd.setCursor(0, 0);
+
+  if (isnan(temperature) || isnan(humidity)) {
+    lcd.print("Sensor read error");
+  } else {
+    char line[17];
+    snprintf(line, sizeof(line), "T:%4.1fC H:%2.0f%%",
+             temperature, humidity);
+    lcd.print(line);
+    // Pad the rest of the row to erase old characters.
+    for (int i = strlen(line); i < 16; i++) {
+      lcd.print(' ');
+    }
+  }
+
+  lcd.setCursor(0, 1);
+
+  if (state == ALARM) {
+    lcd.print("FIRE/GAS ALARM  ");
+  } else if (state == COOLING) {
+    lcd.print("HVAC: COOLING   ");
+  } else {
+    lcd.print("HVAC: NORMAL    ");
+  }
+}
+
+void printStatus() {
+  Serial.println("------------------------");
+
+  if (isnan(temperature) || isnan(humidity)) {
+    Serial.println("DHT22 read failed");
+  } else {
+    Serial.printf("Temperature: %.1f C\n", temperature);
+    Serial.printf("Humidity: %.1f %%\n", humidity);
+  }
+
+  Serial.printf("Gas ADC: %d\n", gasReading);
+  Serial.printf("Gas threshold: %d\n", GAS_THRESHOLD);
+  Serial.printf("State: %s\n", stateName());
+  Serial.printf("HVAC relay: %s\n",
+                state == COOLING ? "ON" : "OFF");
+  Serial.printf("Alarm: %s\n",
+                alarmActive ? "ACTIVE" : "CLEAR");
+}
+
+void connectWiFi() {
+  if (strlen(THINGSPEAK_WRITE_KEY) == 0) {
+    Serial.println("ThingSpeak key missing; cloud upload disabled.");
+    return;
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  Serial.print("Connecting to Wi-Fi");
+
+  unsigned long start = millis();
+
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - start < 10000) {
+    delay(250);
+    Serial.print(".");
+  }
+
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("Wi-Fi connected.");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("Wi-Fi not connected yet.");
+  }
+}
+
+void uploadToThingSpeak() {
+  if (strlen(THINGSPEAK_WRITE_KEY) == 0) {
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Cloud skipped: Wi-Fi disconnected.");
+    return;
+  }
+
+  if (isnan(temperature) || isnan(humidity)) {
+    Serial.println("Cloud skipped: invalid DHT22 data.");
+    return;
+  }
+
+  HTTPClient http;
+
+  String url = String(THINGSPEAK_URL);
+  url += "?api_key=";
+  url += THINGSPEAK_WRITE_KEY;
+  url += "&field1=" + String(temperature, 1);
+  url += "&field2=" + String(humidity, 1);
+  url += "&field3=" + String(gasReading);
+  url += "&field4=" + String(alarmActive ? 1 : 0);
+  url += "&field5=" + String(state == COOLING ? 1 : 0);
+
+  http.begin(url);
+  http.setTimeout(4000);
+
+  int responseCode = http.GET();
+
+  if (responseCode > 0) {
+    String response = http.getString();
+    Serial.printf("ThingSpeak HTTP: %d\n", responseCode);
+
+    if (response.toInt() > 0) {
+      Serial.println("Cloud update accepted.");
+    } else {
+      Serial.println("Update rejected; check channel/key.");
+    }
+  } else {
+    Serial.printf("Cloud request failed: %s\n",
+                  http.errorToString(responseCode).c_str());
+  }
+
+  http.end();
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(GAS_PIN, INPUT);
+
+  // Safe startup: cooling OFF, buzzer OFF.
+  setHVAC(false);
+  noTone(BUZZER_PIN);
+
+  dht.setup(DHT_PIN, DHTesp::DHT22);
+
+  Wire.begin(21, 22);
+  lcd.init();
+  lcd.backlight();
+
+  lcd.setCursor(0, 0);
+  lcd.print("Smart HVAC");
+  lcd.setCursor(0, 1);
+  lcd.print("Starting...");
+  Serial.println("Smart HVAC and Fire-Safety Controller");
+
+  connectWiFi();
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  // Read the sensors at a regular interval.
+  if (now - lastSensorRead >= SENSOR_INTERVAL_MS ||
+      lastSensorRead == 0) {
+    lastSensorRead = now;
+
+    TempAndHumidity data = dht.getTempAndHumidity();
+    temperature = data.temperature;
+    humidity = data.humidity;
+    gasReading = analogRead(GAS_PIN);
+
+    // Invalid temperature readings never demand cooling.
+    alarmActive = gasReading >= GAS_THRESHOLD;
+
+    updateOutputs();
+    updateLCD();
+    printStatus();
+  }
+
+  // Keep cloud requests separate from the sensor loop.
+  if (now - lastCloudUpdate >= CLOUD_INTERVAL_MS ||
+      lastCloudUpdate == 0) {
+    lastCloudUpdate = now;
+    uploadToThingSpeak();
+  }
+}
